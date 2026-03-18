@@ -401,7 +401,7 @@ A:
 
 ## 更新日志
 
-### v3.0 - 2024
+### v3.0
 - ✨ 新增 AV1 编码格式支持
 - ✨ 支持 H.264/HEVC/AV1 三种编码格式
 - ✨ 自动检测并选择最优编码器
@@ -421,8 +421,12 @@ A:
 
 ## 许可证
 
-本项目仅供学习和研究使用。
+本项目采用 **GNU General Public License v3.0** (GPL-3.0) 许可证进行许可。
+
+完整的许可证文本请参阅项目中的 [LICENSE](LICENSE) 文件。
+
+更多信息请访问：[https://www.gnu.org/licenses/gpl-3.0.html](https://www.gnu.org/licenses/gpl-3.0.html)
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 和 Pull Request！通过向本项目提交代码，你同意你的贡献也遵循 GPL-3.0 许可证。
