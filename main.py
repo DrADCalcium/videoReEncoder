@@ -18,7 +18,8 @@ class VideoReEncoder:
     FFMPEG_DIR = Path(__file__).parent / 'ffmpeg_bin'
     
     def __init__(self, input_dir: str, output_dir: Optional[str] = None, 
-                 target_bitrate: str = '1000K', recursive: bool = False, use_gpu: bool = True):
+                 target_bitrate: str = '1000K', recursive: bool = False, 
+                 use_gpu: bool = True, codec: str = 'h264'):
         """
         初始化编码器
         
@@ -28,12 +29,14 @@ class VideoReEncoder:
             target_bitrate: 目标视频码率，如 '1000K', '2M' 等
             recursive: 是否递归处理子目录
             use_gpu: 是否使用 GPU 硬件加速（默认 True）
+            codec: 视频编码器类型 ('h264', 'hevc', 或 'av1')，默认 'h264'
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else None
         self.target_bitrate = target_bitrate
         self.recursive = recursive
         self.use_gpu = use_gpu
+        self.codec = codec.lower()
         
         if not self.input_dir.exists():
             raise FileNotFoundError(f"输入目录不存在：{input_dir}")
@@ -238,15 +241,39 @@ class VideoReEncoder:
             except Exception:
                 output = result.stdout.decode('latin-1', errors='ignore') + result.stderr.decode('latin-1', errors='ignore')
             
-            # 按优先级检测 GPU 编码器
-            gpu_encoders = [
-                ('nvenc_h264', 'NVIDIA NVENC'),      # NVIDIA 最高优先级
-                ('h264_nvenc', 'NVIDIA NVENC (旧版)'),
-                ('h264_qsv', 'Intel QSV'),           # Intel 核显
-                ('h264_amf', 'AMD AMF'),             # AMD 显卡
-                ('h264_vaapi', 'Intel VAAPI'),       # Linux Intel
-                ('h264_videotoolbox', 'Apple VideoToolbox')  # macOS
-            ]
+            # 根据选择的编解码器检测 GPU 编码器
+            if self.codec == 'av1':
+                # AV1 编码器优先级
+                gpu_encoders = [
+                    ('av1_nvenc', 'NVIDIA NVENC AV1'),       # RTX 40 系列支持
+                    ('av1_qsv', 'Intel QSV AV1'),            # Arc 及更新显卡支持
+                    ('av1_amf', 'AMD AMF AV1'),              # RDNA3 及更新显卡支持
+                    ('libaom-av1', 'CPU libaom-av1'),        # CPU 编码（参考）
+                    ('svt-av1', 'CPU SVT-AV1')               # CPU 快速编码（参考）
+                ]
+                encoder_type = 'AV1'
+            elif self.codec == 'hevc':
+                # HEVC/H.265 编码器优先级
+                gpu_encoders = [
+                    ('nvenc_hevc', 'NVIDIA NVENC HEVC'),
+                    ('hevc_nvenc', 'NVIDIA NVENC HEVC (旧版)'),
+                    ('hevc_qsv', 'Intel QSV HEVC'),
+                    ('hevc_amf', 'AMD AMF HEVC'),
+                    ('hevc_vaapi', 'Intel VAAPI HEVC'),
+                    ('hevc_videotoolbox', 'Apple VideoToolbox HEVC')
+                ]
+                encoder_type = 'HEVC (H.265)'
+            else:
+                # H.264 编码器优先级
+                gpu_encoders = [
+                    ('nvenc_h264', 'NVIDIA NVENC'),
+                    ('h264_nvenc', 'NVIDIA NVENC (旧版)'),
+                    ('h264_qsv', 'Intel QSV'),
+                    ('h264_amf', 'AMD AMF'),
+                    ('h264_vaapi', 'Intel VAAPI'),
+                    ('h264_videotoolbox', 'Apple VideoToolbox')
+                ]
+                encoder_type = 'H.264'
             
             for encoder_name, gpu_name in gpu_encoders:
                 if encoder_name in output:
@@ -254,8 +281,21 @@ class VideoReEncoder:
                     print(f"✓ 检测到 GPU 编码器：{gpu_name} ({encoder_name})")
                     return
             
-            print("⚠ 未检测到可用的 GPU 编码器，将使用 CPU 编码 (libx264)")
-            self.gpu_encoder = None
+            # 如果没有 GPU 编码器，使用 CPU 编码器
+            if self.codec == 'av1':
+                # 优先使用 SVT-AV1（更快），其次使用 libaom-av1
+                if 'svt-av1' in output:
+                    self.gpu_encoder = 'svt-av1'
+                    print(f"⚠ 未检测到 GPU AV1 编码器，将使用 CPU SVT-AV1 编码")
+                elif 'libaom-av1' in output:
+                    self.gpu_encoder = 'libaom-av1'
+                    print(f"⚠ 未检测到 GPU AV1 编码器，将使用 CPU libaom-av1 编码")
+                else:
+                    print(f"⚠ 未检测到可用的 AV1 编码器，请确保 FFmpeg 支持 AV1 编码")
+                    self.gpu_encoder = None
+            else:
+                print(f"⚠ 未检测到可用的 {encoder_type} GPU 编码器，将使用 CPU 编码")
+                self.gpu_encoder = None
             
         except Exception as e:
             print(f"✗ GPU 检测失败：{e}，将使用 CPU 编码")
@@ -264,7 +304,16 @@ class VideoReEncoder:
     def get_video_codec(self):
         """获取视频编码器名称"""
         if self.use_gpu and self.gpu_encoder:
-            return self.gpu_encoder
+            # 检查是否是 GPU 编码器
+            if any(gpu in self.gpu_encoder for gpu in ['nvenc', 'qsv', 'amf', 'vaapi', 'videotoolbox']):
+                return self.gpu_encoder
+        
+        # CPU 编码器
+        if self.codec == 'av1':
+            # 优先返回 SVT-AV1（更快），其次 libaom-av1
+            return 'svt-av1' if self.gpu_encoder == 'svt-av1' else 'libaom-av1'
+        elif self.codec == 'hevc':
+            return 'libx265'
         return 'libx264'
     
     def get_encode_params(self):
@@ -286,14 +335,71 @@ class VideoReEncoder:
                 base_params['preset'] = 'p7'  # 高质量预设
                 base_params['tune'] = 'hq'    # 高质量调优
                 base_params['rc'] = 'vbr'     # 可变码率
+                
+                # AV1 特定优化
+                if 'av1' in codec:
+                    base_params['cq'] = '25'  # AV1 质量参数
+                    base_params['temporal-aq'] = '1'
+                    base_params['zerorefdelay'] = '1'
+                # HEVC 特定优化
+                elif 'hevc' in codec:
+                    base_params['cq'] = '23'
+                    base_params['temporal-aq'] = '1'
+                # H.264 特定优化
+                else:
+                    base_params['cq'] = '21'
+                    
             elif 'qsv' in codec:
                 # Intel QSV 特定参数
                 base_params['preset'] = 'slow'
                 base_params['lookahead'] = '1'
+                
+                # AV1 特定优化
+                if 'av1' in codec:
+                    base_params['low_power'] = 'off'
+                    base_params['adaptive_i'] = '1'
+                # HEVC 特定优化
+                elif 'hevc' in codec:
+                    base_params['low_power'] = 'off'
+                    
             elif 'amf' in codec:
                 # AMD AMF 特定参数
                 base_params['quality'] = 'quality'
                 base_params['preusage'] = 'quality'
+                
+                # AV1 特定优化
+                if 'av1' in codec:
+                    base_params['en_preenc'] = '1'
+                    base_params['frame_pacing'] = 'balanced'
+                # HEVC 特定优化
+                elif 'hevc' in codec:
+                    base_params['en_preenc'] = '1'
+        else:
+            # CPU 编码器参数
+            if codec == 'libaom-av1':
+                # AOM-AV1 参数（慢但质量好）
+                base_params['cpu-used'] = '4'  # 速度/质量平衡
+                base_params['auto-alt-ref'] = '1'
+                base_params['enable-cdef'] = '1'
+                base_params['enable-restoration'] = '1'
+                
+            elif codec == 'svt-av1':
+                # SVT-AV1 参数（更快）
+                base_params['preset'] = '8'  # 1-13，数字越大越快
+                base_params['crf'] = '30'    # CRF 模式
+                base_params['tile-columns'] = '4'
+                base_params['tile-rows'] = '2'
+                
+            elif codec == 'libx265':
+                # x265 特定参数
+                base_params['preset'] = 'medium'
+                base_params['crf'] = '28'
+                base_params['x265-params'] = 'aq-mode=2:aq-strength=1.0'
+                
+            elif codec == 'libx264':
+                # x264 特定参数
+                base_params['preset'] = 'medium'
+                base_params['crf'] = '23'
         
         return base_params
     
@@ -344,7 +450,17 @@ class VideoReEncoder:
         """
         print(f"\n正在处理：{input_path.name}")
         codec_name = self.get_video_codec()
-        print(f"  使用编码器：{'GPU - ' + self.gpu_encoder if self.gpu_encoder else 'CPU - libx264'}")
+        codec_display = f"{'GPU - ' if self.use_gpu and any(g in codec_name for g in ['nvenc', 'qsv', 'amf']) else 'CPU - '}{codec_name}"
+        print(f"  使用编码器：{codec_display}")
+        
+        # 显示编码格式
+        if self.codec == 'av1':
+            format_display = 'AV1 (最新一代)'
+        elif self.codec == 'hevc':
+            format_display = 'HEVC (H.265)'
+        else:
+            format_display = 'H.264'
+        print(f"  编码格式：{format_display}")
         print(f"  目标视频码率：{self.target_bitrate}")
         
         # 获取原始视频码率
@@ -508,6 +624,8 @@ def main():
   python main.py -i ./videos -o ./output -b 2M -r
   python main.py --input-dir ./videos --bitrate 1500K
   python main.py -i ./videos -b 1000K --cpu  # 强制使用 CPU 编码
+  python main.py -i ./videos -b 800K --codec hevc  # 使用 HEVC 编码
+  python main.py -i ./videos -b 600K --codec av1   # 使用 AV1 编码（推荐）
         """
     )
     
@@ -521,6 +639,8 @@ def main():
                        help='是否递归处理子目录')
     parser.add_argument('--cpu', action='store_true',
                        help='强制使用 CPU 编码，不使用 GPU 加速')
+    parser.add_argument('--codec', choices=['h264', 'hevc', 'av1'], default='h264',
+                       help='视频编码格式（默认：h264）。选项：h264（兼容性好）、hevc（高效）、av1（最新最高效）')
     
     args = parser.parse_args()
     
@@ -530,7 +650,8 @@ def main():
             output_dir=args.output_dir,
             target_bitrate=args.bitrate,
             recursive=args.recursive,
-            use_gpu=not args.cpu
+            use_gpu=not args.cpu,
+            codec=args.codec
         )
         encoder.process()
     except Exception as e:
