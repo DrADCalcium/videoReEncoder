@@ -4,12 +4,16 @@ import argparse
 from pathlib import Path
 from typing import List, Optional
 import ffmpeg
+import sys
+import zipfile
+import shutil
 
 
 class VideoReEncoder:
     """视频重新编码器，用于批量压缩视频码率"""
     
     VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm', '.wmv', '.m4v'}
+    FFMPEG_DIR = Path(__file__).parent / 'ffmpeg_bin'
     
     def __init__(self, input_dir: str, output_dir: Optional[str] = None, 
                  target_bitrate: str = '1000K', recursive: bool = False):
@@ -30,7 +34,106 @@ class VideoReEncoder:
         if not self.input_dir.exists():
             raise FileNotFoundError(f"输入目录不存在：{input_dir}")
         
-        self._check_ffmpeg()
+        self._ensure_ffmpeg()
+    
+    def _download_ffmpeg(self):
+        """下载便携版 FFmpeg"""
+        print("正在下载 FFmpeg...")
+        
+        try:
+            import urllib.request
+            import ssl
+            
+            # 创建 SSL 不验证上下文（用于下载）
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Windows 平台的 FFmpeg 下载链接（使用 gyan.dev 的构建版本）
+            ffmpeg_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            
+            self.FFMPEG_DIR.mkdir(exist_ok=True)
+            zip_path = self.FFMPEG_DIR / "ffmpeg.zip"
+            
+            # 下载文件
+            with urllib.request.urlopen(ffmpeg_url, context=ssl_context) as response:
+                total_size = int(response.getheader('Content-Length', 0))
+                downloaded = 0
+                
+                with open(zip_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        f.write(chunk)
+                        
+                        # 显示下载进度
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            print(f"\r下载进度：{percent:.1f}%", end='', flush=True)
+            
+            print("\n正在解压 FFmpeg...")
+            
+            # 解压文件
+            with zipfile.ZipFile(str(zip_path), 'r') as zip_ref:
+                # 找到包含 exe 文件的目录
+                for name in zip_ref.namelist():
+                    if 'bin/ffmpeg.exe' in name:
+                        base_dir = name.split('/')[0]
+                        break
+                
+                # 提取 ffmpeg.exe、ffprobe.exe 等文件
+                for name in zip_ref.namelist():
+                    if name.startswith(f"{base_dir}/bin/") and name.endswith('.exe'):
+                        zip_ref.extract(name, str(self.FFMPEG_DIR))
+                        # 移动到 FFMPEG_DIR 根目录
+                        extracted_path = self.FFMPEG_DIR / name
+                        final_path = self.FFMPEG_DIR / Path(name).name
+                        if extracted_path != final_path:
+                            shutil.move(str(extracted_path), str(final_path))
+                
+                # 清理多余目录
+                for item in self.FFMPEG_DIR.iterdir():
+                    if item.is_dir() and item.name != '__pycache__':
+                        shutil.rmtree(item)
+            
+            # 删除压缩包
+            zip_path.unlink()
+            
+            print("✓ FFmpeg 下载完成")
+            
+        except Exception as e:
+            print(f"\n✗ FFmpeg 下载失败：{e}")
+            raise RuntimeError(f"无法下载 FFmpeg: {e}")
+    
+    def _ensure_ffmpeg(self):
+        """确保 FFmpeg 可用，如果不可用则下载"""
+        ffmpeg_exe = self.FFMPEG_DIR / 'ffmpeg.exe'
+        ffprobe_exe = self.FFMPEG_DIR / 'ffprobe.exe'
+        
+        if not ffmpeg_exe.exists() or not ffprobe_exe.exists():
+            print("未检测到 FFmpeg，正在下载便携版...")
+            self._download_ffmpeg()
+        
+        # 将 FFmpeg 添加到 PATH
+        ffmpeg_path = str(self.FFMPEG_DIR)
+        if ffmpeg_path not in os.environ['PATH']:
+            os.environ['PATH'] = ffmpeg_path + os.pathsep + os.environ['PATH']
+        
+        # 验证 FFmpeg 是否可用
+        try:
+            result = subprocess.run(
+                [str(ffmpeg_exe), '-version'],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                raise RuntimeError("FFmpeg 验证失败")
+            print(f"✓ FFmpeg 已就绪：{ffmpeg_exe}")
+        except Exception as e:
+            print(f"FFmpeg 验证失败：{e}")
+            self._download_ffmpeg()
     
     def _check_ffmpeg(self):
         """检查 ffmpeg 二进制文件是否可用"""
@@ -92,6 +195,12 @@ class VideoReEncoder:
         temp_output = output_path.with_suffix('.temp.mp4')
         
         try:
+            # 保存原始的 ffmpeg 二进制路径
+            original_ffmpeg = os.environ.get('FFMPEG_BINARY')
+            
+            # 设置 FFMPEG_BINARY 环境变量指向本地 FFmpeg
+            os.environ['FFMPEG_BINARY'] = str(self.FFMPEG_DIR / 'ffmpeg.exe')
+            
             (
                 ffmpeg
                 .input(str(input_path))
@@ -103,6 +212,12 @@ class VideoReEncoder:
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
             )
+            
+            # 恢复原始环境变量
+            if original_ffmpeg:
+                os.environ['FFMPEG_BINARY'] = original_ffmpeg
+            else:
+                os.environ.pop('FFMPEG_BINARY', None)
             
             temp_output.rename(output_path)
             print(f"  ✓ 编码完成：{output_path.name}")
