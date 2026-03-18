@@ -7,6 +7,8 @@ import ffmpeg
 import sys
 import zipfile
 import shutil
+import re
+from tqdm import tqdm
 
 
 class VideoReEncoder:
@@ -175,6 +177,24 @@ class VideoReEncoder:
         except Exception:
             return '128K'
     
+    def get_video_duration(self, video_path: Path) -> float:
+        """获取视频时长（秒）"""
+        try:
+            probe = ffmpeg.probe(str(video_path), select_streams='v:0', show_entries='format=duration')
+            duration = float(probe.get('format', {}).get('duration', 0))
+            
+            if duration == 0:
+                probe = ffmpeg.probe(str(video_path))
+                streams = probe.get('streams', [])
+                for stream in streams:
+                    if stream.get('codec_type') == 'video':
+                        duration = float(stream.get('duration', 0))
+                        break
+            
+            return duration if duration > 0 else 1
+        except Exception:
+            return 1
+    
     def encode_video(self, input_path: Path, output_path: Path) -> bool:
         """
         编码单个视频文件
@@ -195,36 +215,70 @@ class VideoReEncoder:
         temp_output = output_path.with_suffix('.temp.mp4')
         
         try:
+            # 获取视频时长
+            duration = self.get_video_duration(input_path)
+            
             # 保存原始的 ffmpeg 二进制路径
             original_ffmpeg = os.environ.get('FFMPEG_BINARY')
             
             # 设置 FFMPEG_BINARY 环境变量指向本地 FFmpeg
             os.environ['FFMPEG_BINARY'] = str(self.FFMPEG_DIR / 'ffmpeg.exe')
             
-            (
-                ffmpeg
-                .input(str(input_path))
-                .output(
-                    str(temp_output),
-                    **{'c:v': 'libx264', 'b:v': self.target_bitrate, 'c:a': 'aac', 
-                       'b:a': audio_bitrate, 'strict': 'experimental', 'y': None}
-                )
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
+            # 构建 FFmpeg 命令
+            cmd = [
+                str(self.FFMPEG_DIR / 'ffmpeg.exe'),
+                '-i', str(input_path),
+                '-c:v', 'libx264',
+                '-b:v', self.target_bitrate,
+                '-c:a', 'aac',
+                '-b:a', audio_bitrate,
+                '-strict', 'experimental',
+                '-y',
+                str(temp_output)
+            ]
+            
+            # 启动进程，使用 unbuffered 模式
+            import subprocess
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
             )
             
-            # 恢复原始环境变量
-            if original_ffmpeg:
-                os.environ['FFMPEG_BINARY'] = original_ffmpeg
-            else:
-                os.environ.pop('FFMPEG_BINARY', None)
+            # 解析进度
+            time_pattern = re.compile(r'time=(\d+):(\d+):(\d+)\.(\d+)')
+            
+            with tqdm(total=duration, desc='  处理进度', unit='s', bar_format='{l_bar}{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                # 逐行读取 stderr
+                for line in process.stderr:
+                    match = time_pattern.search(line)
+                    if match:
+                        hours, minutes, seconds, microseconds = map(int, match.groups())
+                        current_time = hours * 3600 + minutes * 60 + seconds + microseconds / 1000000
+                        pbar.n = current_time
+                        pbar.refresh()
+                
+                # 等待进程结束
+                process.wait()
+                
+                # 恢复原始环境变量
+                if original_ffmpeg:
+                    os.environ['FFMPEG_BINARY'] = original_ffmpeg
+                else:
+                    os.environ.pop('FFMPEG_BINARY', None)
+                
+                if process.returncode != 0:
+                    error_output = process.stderr.read()
+                    raise RuntimeError(f"FFmpeg 错误：{error_output}")
             
             temp_output.rename(output_path)
             print(f"  ✓ 编码完成：{output_path.name}")
             return True
             
-        except ffmpeg.Error as e:
-            error_msg = e.stderr.decode('utf-8') if e.stderr else str(e)
+        except Exception as e:
+            error_msg = str(e)
             print(f"  ✗ 编码失败：{error_msg}")
             if temp_output.exists():
                 temp_output.unlink()
