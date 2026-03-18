@@ -297,6 +297,40 @@ class VideoReEncoder:
         
         return base_params
     
+    def get_video_bitrate(self, video_path: Path) -> Optional[int]:
+        """获取视频文件的视频码率（bps）"""
+        try:
+            probe = ffmpeg.probe(str(video_path), select_streams='v:0', show_entries='stream=bit_rate')
+            streams = probe.get('streams', [])
+            
+            if streams and len(streams) > 0:
+                bit_rate = streams[0].get('bit_rate')
+                if bit_rate and bit_rate != 'N/A':
+                    return int(bit_rate)
+            
+            # 如果流级别没有码率信息，尝试从文件级别获取
+            probe = ffmpeg.probe(str(video_path), show_entries='format=bit_rate')
+            format_info = probe.get('format', {})
+            bit_rate = format_info.get('bit_rate')
+            if bit_rate and bit_rate != 'N/A':
+                return int(bit_rate)
+            
+            return None
+        except Exception:
+            return None
+    
+    def parse_bitrate_to_bps(self, bitrate_str: str) -> int:
+        """将码率字符串转换为 bps"""
+        bitrate_str = bitrate_str.upper().strip()
+        
+        if bitrate_str.endswith('M'):
+            return int(float(bitrate_str[:-1]) * 1_000_000)
+        elif bitrate_str.endswith('K'):
+            return int(float(bitrate_str[:-1]) * 1_000)
+        else:
+            # 假设是纯数字，单位为 bps
+            return int(bitrate_str)
+    
     def encode_video(self, input_path: Path, output_path: Path) -> bool:
         """
         编码单个视频文件
@@ -312,6 +346,19 @@ class VideoReEncoder:
         codec_name = self.get_video_codec()
         print(f"  使用编码器：{'GPU - ' + self.gpu_encoder if self.gpu_encoder else 'CPU - libx264'}")
         print(f"  目标视频码率：{self.target_bitrate}")
+        
+        # 获取原始视频码率
+        original_bitrate = self.get_video_bitrate(input_path)
+        target_bitrate_bps = self.parse_bitrate_to_bps(self.target_bitrate)
+        
+        if original_bitrate:
+            print(f"  原始视频码率：{original_bitrate:,} bps ({original_bitrate/1000:.0f}K)")
+            print(f"  目标视频码率：{target_bitrate_bps:,} bps ({target_bitrate_bps/1000:.0f}K)")
+            
+            # 检查是否需要重新编码
+            if original_bitrate <= target_bitrate_bps:
+                print(f"  ✓ 跳过：原始码率已低于目标码率，无需处理")
+                return True
         
         audio_bitrate = self.get_audio_bitrate(input_path)
         print(f"  检测到音频码率：{audio_bitrate}")
@@ -339,9 +386,9 @@ class VideoReEncoder:
                 '-b:a', audio_bitrate,
                 '-strict', 'experimental',
                 '-pix_fmt', 'yuv420p',
-                '-progress', 'pipe:1',  # 输出进度到 stdout
-                '-loglevel', 'quiet',   # 安静模式，只输出必要信息
-                '-stats_period', '0.5', # 每 0.5 秒更新一次统计
+                '-progress', 'pipe:1',
+                '-loglevel', 'quiet',
+                '-stats_period', '0.5',
                 '-y',
                 str(temp_output)
             ]
