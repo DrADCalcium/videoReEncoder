@@ -16,16 +16,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import os
-import subprocess
 import argparse
+import os
+import re
+import shutil
+import subprocess
+import zipfile
 from pathlib import Path
 from typing import List, Optional
+
 import ffmpeg
-import sys
-import zipfile
-import shutil
-import re
 from tqdm import tqdm
 
 
@@ -37,7 +37,8 @@ class VideoReEncoder:
     
     def __init__(self, input_dir: str, output_dir: Optional[str] = None, 
                  target_bitrate: str = '1000K', recursive: bool = False, 
-                 use_gpu: bool = True, codec: str = 'h264'):
+                 use_gpu: bool = True, codec: str = 'h264',
+                 copy_skipped: bool = False):
         """
         初始化编码器
         
@@ -48,6 +49,7 @@ class VideoReEncoder:
             recursive: 是否递归处理子目录
             use_gpu: 是否使用 GPU 硬件加速（默认 True）
             codec: 视频编码器类型 ('h264', 'hevc', 或 'av1')，默认 'h264'
+            copy_skipped: 是否将跳过的视频复制到输出目录（默认 False）
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else None
@@ -55,6 +57,7 @@ class VideoReEncoder:
         self.recursive = recursive
         self.use_gpu = use_gpu
         self.codec = codec.lower()
+        self.copy_skipped = copy_skipped
         
         if not self.input_dir.exists():
             raise FileNotFoundError(f"输入目录不存在：{input_dir}")
@@ -492,7 +495,20 @@ class VideoReEncoder:
             # 检查是否需要重新编码
             if original_bitrate <= target_bitrate_bps:
                 print(f"  ✓ 跳过：原始码率已低于目标码率，无需处理")
-                return True
+                
+                # 如果启用了复制跳过文件功能
+                if self.copy_skipped:
+                    print(f"  📋 复制原文件到输出目录...")
+                    try:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(input_path), str(output_path))
+                        print(f"  ✓ 复制完成：{output_path.name}")
+                        return True
+                    except Exception as e:
+                        print(f"  ✗ 复制失败：{e}")
+                        return False
+                else:
+                    return True
         
         audio_bitrate = self.get_audio_bitrate(input_path)
         print(f"  检测到音频码率：{audio_bitrate}")
@@ -644,6 +660,7 @@ def main():
   python main.py -i ./videos -b 1000K --cpu  # 强制使用 CPU 编码
   python main.py -i ./videos -b 800K --codec hevc  # 使用 HEVC 编码
   python main.py -i ./videos -b 600K --codec av1   # 使用 AV1 编码（推荐）
+  python main.py -i ./videos -b 1000K -o ./output --copy-skipped  # 复制跳过的视频
         """
     )
     
@@ -659,6 +676,8 @@ def main():
                        help='强制使用 CPU 编码，不使用 GPU 加速')
     parser.add_argument('--codec', choices=['h264', 'hevc', 'av1'], default='h264',
                        help='视频编码格式（默认：h264）。选项：h264（兼容性好）、hevc（高效）、av1（最新最高效）')
+    parser.add_argument('--copy-skipped', '-c', action='store_true',
+                       help='将因码率低于目标而跳过的视频复制到输出目录（默认不复制）')
     
     args = parser.parse_args()
     
@@ -669,7 +688,8 @@ def main():
             target_bitrate=args.bitrate,
             recursive=args.recursive,
             use_gpu=not args.cpu,
-            codec=args.codec
+            codec=args.codec,
+            copy_skipped=args.copy_skipped
         )
         encoder.process()
     except Exception as e:
