@@ -23,10 +23,345 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
 
 import ffmpeg
 from tqdm import tqdm
+
+
+@dataclass
+class SampleSegment:
+    """采样片段信息"""
+    start_time: float  # 开始时间（秒）
+    duration: float    # 持续时间（秒）
+    
+@dataclass
+class SampleResult:
+    """采样结果"""
+    segment: SampleSegment
+    original_size: int   # 原始片段大小（字节）
+    compressed_size: int # 压缩后大小（字节）
+    compression_ratio: float  # 压缩率 = compressed / original
+    success: bool        # 是否成功
+    error_msg: str = ""  # 错误信息
+
+
+class CRFSampleEstimator:
+    """CRF多点采样预估器
+    
+    用于在正式转码前，对视频部分片段进行真实CRF编码采样，
+    预估目标CRF下的大致压缩收益。
+    """
+    
+    def __init__(self, crf: int, codec: str = 'h264', use_gpu: bool = True,
+                 min_benefit_threshold: float = 0.10, max_sample_count: int = 5,
+                 sample_duration_base: float = 20.0):
+        """
+        初始化采样预估器
+        
+        Args:
+            crf: 目标CRF值
+            codec: 编码器类型
+            use_gpu: 是否使用GPU加速
+            min_benefit_threshold: 最小收益阈值（默认10%），低于此值则跳过
+            max_sample_count: 最大采样点数（默认5个）
+            sample_duration_base: 基础采样时长（默认20秒）
+        """
+        self.crf = crf
+        self.codec = codec
+        self.use_gpu = use_gpu
+        self.min_benefit_threshold = min_benefit_threshold
+        self.max_sample_count = max_sample_count
+        self.sample_duration_base = sample_duration_base
+        self.ffmpeg_dir = Path(__file__).parent / 'ffmpeg_bin'
+    
+    def calculate_sample_plan(self, duration: float) -> List[SampleSegment]:
+        """根据视频时长计算采样计划
+        
+        Args:
+            duration: 视频总时长（秒）
+            
+        Returns:
+            采样片段列表
+        """
+        segments = []
+        
+        if duration <= 0:
+            return segments
+        
+        # 短视频特殊处理：小于30秒的视频不采样，直接转码
+        if duration < 30:
+            return segments
+        
+        # 动态调整采样策略
+        if duration < 60:
+            # 30-60秒：单点采样，时长10秒
+            sample_count = 1
+            sample_duration = min(10.0, duration * 0.3)
+        elif duration < 180:
+            # 1-3分钟：2点采样，时长15秒
+            sample_count = 2
+            sample_duration = min(15.0, duration * 0.2)
+        elif duration < 600:
+            # 3-10分钟：3点采样，时长20秒
+            sample_count = 3
+            sample_duration = min(20.0, duration * 0.15)
+        elif duration < 1800:
+            # 10-30分钟：4点采样，时长25秒
+            sample_count = 4
+            sample_duration = min(25.0, duration * 0.1)
+        else:
+            # 30分钟以上：5点采样，时长30秒
+            sample_count = min(self.max_sample_count, 5)
+            sample_duration = min(30.0, duration * 0.05)
+        
+        # 计算采样时间点（均匀分布，避免边缘）
+        margin = sample_duration * 0.5  # 距离边缘的缓冲
+        usable_duration = duration - 2 * margin
+        
+        if usable_duration < sample_duration:
+            # 可用时长不足，只采中间一点
+            start_time = (duration - sample_duration) / 2
+            segments.append(SampleSegment(start_time=start_time, duration=sample_duration))
+        else:
+            # 均匀分布采样点
+            for i in range(sample_count):
+                if sample_count == 1:
+                    # 单点：放在中间
+                    position = 0.5
+                else:
+                    # 多点：均匀分布
+                    position = (i + 1) / (sample_count + 1)
+                
+                start_time = margin + position * usable_duration - sample_duration / 2
+                
+                # 确保不越界
+                start_time = max(0, min(start_time, duration - sample_duration))
+                
+                segments.append(SampleSegment(start_time=start_time, duration=sample_duration))
+        
+        return segments
+    
+    def encode_sample_segment(self, video_path: Path, segment: SampleSegment, 
+                              output_path: Path) -> Tuple[int, int, bool, str]:
+        """编码单个采样片段
+        
+        Args:
+            video_path: 输入视频路径
+            segment: 采样片段信息
+            output_path: 输出文件路径
+            
+        Returns:
+            (original_size, compressed_size, success, error_msg)
+        """
+        try:
+            # 获取编码器
+            codec_name = self._get_codec_name()
+            
+            # 构建FFmpeg命令进行片段采样编码
+            cmd = [
+                str(self.ffmpeg_dir / 'ffmpeg.exe'),
+                '-ss', str(segment.start_time),  # 开始时间
+                '-i', str(video_path),
+                '-t', str(segment.duration),     # 持续时间
+                '-c:v', codec_name,
+            ]
+            
+            # 添加CRF参数
+            if 'nvenc' in codec_name:
+                cmd.extend(['-cq', str(self.crf)])
+            elif 'qsv' in codec_name:
+                cmd.extend(['-global_quality', str(self.crf)])
+            elif 'amf' in codec_name:
+                cmd.extend(['-qp_i', str(self.crf), '-qp_p', str(self.crf), '-qp_b', str(self.crf)])
+            else:
+                cmd.extend(['-crf', str(self.crf)])
+            
+            cmd.extend([
+                '-c:a', 'aac',
+                '-b:a', '128K',
+                '-pix_fmt', 'yuv420p',
+                '-loglevel', 'error',
+                '-y',
+                str(output_path)
+            ])
+            
+            # 执行编码
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=120  # 2分钟超时
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8', errors='ignore')[:200]
+                return 0, 0, False, f"FFmpeg错误: {error_msg}"
+            
+            # 获取文件大小
+            if not output_path.exists():
+                return 0, 0, False, "输出文件未生成"
+            
+            compressed_size = output_path.stat().st_size
+            
+            # 估算原始片段大小（按时间比例）
+            full_size = video_path.stat().st_size
+            probe = ffmpeg.probe(str(video_path), show_entries='format=duration')
+            full_duration = float(probe.get('format', {}).get('duration', segment.duration))
+            
+            if full_duration > 0:
+                original_size = int(full_size * (segment.duration / full_duration))
+            else:
+                original_size = compressed_size  # 无法估算，假设相同
+            
+            return original_size, compressed_size, True, ""
+            
+        except subprocess.TimeoutExpired:
+            return 0, 0, False, "采样编码超时"
+        except Exception as e:
+            return 0, 0, False, str(e)
+    
+    def _get_codec_name(self) -> str:
+        """获取编码器名称"""
+        if self.use_gpu:
+            if self.codec == 'av1':
+                return 'av1_nvenc'  # 简化，实际应该检测
+            elif self.codec == 'hevc':
+                return 'hevc_nvenc'
+            else:
+                return 'h264_nvenc'
+        else:
+            if self.codec == 'av1':
+                return 'libaom-av1'
+            elif self.codec == 'hevc':
+                return 'libx265'
+            else:
+                return 'libx264'
+    
+    def estimate_compression_benefit(self, video_path: Path, duration: float) -> Optional[dict]:
+        """预估压缩收益
+        
+        Args:
+            video_path: 视频文件路径
+            duration: 视频时长（秒）
+            
+        Returns:
+            预估结果字典，包含：
+            - estimated_ratio: 预估压缩率
+            - estimated_benefit: 预估收益百分比
+            - should_skip: 是否应该跳过
+            - sample_count: 实际采样数
+            - samples: 采样结果列表
+            如果无法预估则返回None
+        """
+        # 计算采样计划
+        segments = self.calculate_sample_plan(duration)
+        
+        # 如果没有采样片段（短视频），返回None表示直接转码
+        if not segments:
+            return None
+        
+        print(f"  🔍 开始CRF采样预估（{len(segments)}个采样点）...")
+        
+        samples = []
+        total_original = 0
+        total_compressed = 0
+        successful_samples = 0
+        
+        temp_dir = video_path.parent / '.temp_samples'
+        temp_dir.mkdir(exist_ok=True)
+        
+        try:
+            for i, segment in enumerate(segments, 1):
+                temp_output = temp_dir / f"sample_{video_path.stem}_{i}.mp4"
+                
+                print(f"    采样 {i}/{len(segments)}: {segment.start_time:.1f}s ~ {segment.start_time + segment.duration:.1f}s", end='')
+                
+                original_size, compressed_size, success, error_msg = self.encode_sample_segment(
+                    video_path, segment, temp_output
+                )
+                
+                if success and original_size > 0:
+                    ratio = compressed_size / original_size if original_size > 0 else 1.0
+                    benefit = (1 - ratio) * 100
+                    
+                    total_original += original_size
+                    total_compressed += compressed_size
+                    successful_samples += 1
+                    
+                    sample_result = SampleResult(
+                        segment=segment,
+                        original_size=original_size,
+                        compressed_size=compressed_size,
+                        compression_ratio=ratio,
+                        success=True
+                    )
+                    samples.append(sample_result)
+                    
+                    print(f" | 压缩率: {ratio:.2f} (收益: {benefit:.1f}%)")
+                else:
+                    print(f" | ✗ 失败: {error_msg}")
+                    sample_result = SampleResult(
+                        segment=segment,
+                        original_size=0,
+                        compressed_size=0,
+                        compression_ratio=1.0,
+                        success=False,
+                        error_msg=error_msg
+                    )
+                    samples.append(sample_result)
+                
+                # 清理临时文件
+                if temp_output.exists():
+                    temp_output.unlink()
+        
+        finally:
+            # 清理临时目录
+            if temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+        
+        # 如果没有成功的采样，返回None
+        if successful_samples == 0:
+            print(f"  ⚠ 所有采样均失败，跳过预估")
+            return None
+        
+        # 计算整体压缩率
+        overall_ratio = total_compressed / total_original if total_original > 0 else 1.0
+        overall_benefit = (1 - overall_ratio) * 100
+        
+        # 检查采样结果的离散程度
+        if len(samples) > 1:
+            ratios = [s.compression_ratio for s in samples if s.success]
+            if ratios:
+                avg_ratio = sum(ratios) / len(ratios)
+                variance = sum((r - avg_ratio) ** 2 for r in ratios) / len(ratios)
+                std_dev = variance ** 0.5
+                
+                # 如果标准差过大，说明视频内容变化大，预估可能不准确
+                if std_dev > 0.15:  # 标准差超过15%
+                    print(f"  ⚠ 采样结果差异较大 (σ={std_dev:.2f})，预估仅供参考")
+        
+        should_skip = overall_benefit < self.min_benefit_threshold * 100
+        
+        result = {
+            'estimated_ratio': overall_ratio,
+            'estimated_benefit': overall_benefit,
+            'should_skip': should_skip,
+            'sample_count': successful_samples,
+            'samples': samples,
+            'total_original_size': total_original,
+            'total_compressed_size': total_compressed
+        }
+        
+        if should_skip:
+            print(f"  ⏭ 预估收益过低 ({overall_benefit:.1f}%)，将跳过转码")
+        else:
+            print(f"  ✓ 预估收益: {overall_benefit:.1f}% (压缩率: {overall_ratio:.2f})")
+        
+        return result
 
 
 class VideoReEncoder:
@@ -38,7 +373,8 @@ class VideoReEncoder:
     def __init__(self, input_dir: str, output_dir: Optional[str] = None, 
                  target_bitrate: str = '1000K', recursive: bool = False, 
                  use_gpu: bool = True, codec: str = 'h264',
-                 copy_skipped: bool = False, crf: Optional[int] = None):
+                 copy_skipped: bool = False, crf: Optional[int] = None,
+                 min_benefit_threshold: float = 10.0, max_sample_count: int = 5):
         """
         初始化编码器
         
@@ -51,6 +387,8 @@ class VideoReEncoder:
             codec: 视频编码器类型 ('h264', 'hevc', 或 'av1')，默认 'h264'
             copy_skipped: 是否将跳过的视频复制到输出目录（默认 False）
             crf: CRF值（恒定质量因子），范围0-51，值越小质量越高。如果设置则优先使用CRF模式
+            min_benefit_threshold: CRF采样预估的最小收益阈值（百分比）
+            max_sample_count: CRF采样预估的最大采样点数
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else None
@@ -76,6 +414,18 @@ class VideoReEncoder:
         self._ensure_ffmpeg()
         if self.use_gpu:
             self._detect_gpu_encoder()
+        
+        # 初始化CRF采样预估器（仅在CRF模式下）
+        self.sample_estimator = None
+        if self.crf is not None:
+            self.sample_estimator = CRFSampleEstimator(
+                crf=self.crf,
+                codec=self.codec,
+                use_gpu=self.use_gpu,
+                min_benefit_threshold=min_benefit_threshold / 100.0,  # 转换为小数
+                max_sample_count=max_sample_count,
+                sample_duration_base=20.0
+            )
     
     def _download_ffmpeg(self):
         """下载便携版 FFmpeg"""
@@ -509,106 +859,6 @@ class VideoReEncoder:
             # 假设是纯数字，单位为 bps
             return int(bitrate_str)
     
-    def estimate_video_crf(self, video_path: Path) -> Optional[float]:
-        """
-        估算视频的等效CRF值
-            
-        通过分析视频的实际码率、分辨率、帧率和编码器类型，估算其大致的CRF质量水平。
-        CRF值越小表示质量越高。
-            
-        Args:
-            video_path: 视频文件路径
-                
-        Returns:
-            估算的CRF值，如果无法估算则返回None
-        """
-        try:
-            probe = ffmpeg.probe(str(video_path))
-                
-            # 获取视频流信息
-            video_stream = None
-            for stream in probe.get('streams', []):
-                if stream.get('codec_type') == 'video':
-                    video_stream = stream
-                    break
-                
-            if not video_stream:
-                return None
-                
-            # 获取关键参数
-            codec_name = video_stream.get('codec_name', '').lower()
-            width = int(video_stream.get('width', 0))
-            height = int(video_stream.get('height', 0))
-            bit_rate = video_stream.get('bit_rate')
-            
-            # 获取帧率（用于更准确的估算）
-            frame_rate_str = video_stream.get('r_frame_rate', '30/1')
-            if '/' in frame_rate_str:
-                num, den = frame_rate_str.split('/')
-                frame_rate = float(num) / float(den) if float(den) != 0 else 30
-            else:
-                frame_rate = float(frame_rate_str)
-                
-            if not bit_rate or bit_rate == 'N/A':
-                # 尝试从 format获取
-                format_bitrate = probe.get('format', {}).get('bit_rate')
-                if format_bitrate and format_bitrate != 'N/A':
-                    bit_rate = format_bitrate
-                else:
-                    # 无法获取码率，返回None让程序继续编码
-                    return None
-                
-            bit_rate = int(bit_rate)
-            resolution = width * height
-            
-            # 检查码率是否合理（排除异常情况）
-            # 如果码率过高（>100Mbps），可能是VBR峰值或异常值，不进行估算
-            if bit_rate > 100_000_000:
-                print(f"  ⚠ 警告：检测到异常高的码率 ({bit_rate/1_000_000:.1f}Mbps)，跳过质量检测")
-                return None
-            
-            # 计算每像素每帧的比特数（bpp），这是更准确的质量指标
-            # bpp = bit_rate / (width * height * frame_rate)
-            if frame_rate > 0 and resolution > 0:
-                bpp = bit_rate / (resolution * frame_rate)
-            else:
-                bpp = 0.1  # 默认值
-            
-            # 根据不同编码器，使用bpp来估算CRF
-            # bpp与CRF的关系：bpp越高，CRF越低（质量越好）
-            if 'h264' in codec_name or 'avc' in codec_name:
-                # H.264: bpp 0.1 ≈ CRF 23, bpp 0.2 ≈ CRF 18, bpp 0.05 ≈ CRF 28
-                # 公式：CRF = 23 - 15 * log2(bpp / 0.1)
-                import math
-                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.1)
-            elif 'hevc' in codec_name or 'h265' in codec_name:
-                # HEVC效率比H.264高约50%，相同bpp下CRF可以更低
-                # HEVC: bpp 0.05 ≈ CRF 23, bpp 0.1 ≈ CRF 18
-                import math
-                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.05)
-            elif 'av1' in codec_name:
-                # AV1效率更高
-                # AV1: bpp 0.04 ≈ CRF 23, bpp 0.08 ≈ CRF 18
-                import math
-                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.04)
-            else:
-                # 未知编码器，使用H.264作为参考
-                import math
-                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.1)
-            
-            # 限制在合理范围内（1-51）
-            # CRF=0是无损，实际很少使用；CRF=51是最低质量
-            estimated_crf = max(1, min(51, estimated_crf))
-            
-            # 调试信息：显示计算过程
-            # print(f"  [调试] 分辨率: {width}x{height}, 帧率: {frame_rate:.1f}fps, bpp: {bpp:.4f}")
-                
-            return round(estimated_crf, 1)
-                
-        except Exception as e:
-            print(f"  ⚠ 无法估算视频CRF值：{e}")
-            return None
-    
     def encode_video(self, input_path: Path, output_path: Path) -> bool:
         """
         编码单个视频文件
@@ -644,35 +894,34 @@ class VideoReEncoder:
         if self.crf is not None:
             print(f"  码率控制：CRF模式 (CRF={self.crf})")
             
-            # CRF模式下，检测视频质量是否需要压缩
-            estimated_crf = self.estimate_video_crf(input_path)
-            if estimated_crf is not None:
-                print(f"  估算视频质量：等效CRF≈{estimated_crf}")
+            # CRF模式下，先进行采样预估
+            if self.sample_estimator:
+                duration = self.get_video_duration(input_path)
+                estimate_result = self.sample_estimator.estimate_compression_benefit(input_path, duration)
                 
-                # CRF值越小质量越高，如果视频的等效CRF < 目标CRF，说明质量过高，可以压缩以减小体积
-                if estimated_crf < self.crf:
-                    crf_diff = self.crf - estimated_crf
-                    print(f"  ℹ 需要重新编码：视频质量超过目标（{estimated_crf} < {self.crf}），将压缩以减小体积（差距{crf_diff:.1f}）")
-                else:
-                    # estimated_crf >= self.crf，视频质量已达标或不足，直接跳过
-                    if estimated_crf == self.crf:
-                        print(f"  ✓ 跳过：视频质量正好达到目标标准（{estimated_crf} = {self.crf}）")
-                    else:
-                        print(f"  ✓ 跳过：视频质量未达标但保持原样（{estimated_crf} > {self.crf}）")
-                    
-                    # 如果启用了复制跳过文件功能
-                    if self.copy_skipped:
-                        print(f"  📋 复制原文件到输出目录...")
-                        try:
-                            output_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(str(input_path), str(output_path))
-                            print(f"  ✓ 复制完成：{output_path.name}")
+                if estimate_result is not None:
+                    # 有采样结果，根据预估决定是否跳过
+                    if estimate_result['should_skip']:
+                        print(f"  ⏭ 跳过：预估压缩收益过低 ({estimate_result['estimated_benefit']:.1f}%)")
+                        
+                        # 如果启用了复制跳过文件功能
+                        if self.copy_skipped:
+                            print(f"  📋 复制原文件到输出目录...")
+                            try:
+                                output_path.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(input_path), str(output_path))
+                                print(f"  ✓ 复制完成：{output_path.name}")
+                                return True
+                            except Exception as e:
+                                print(f"  ✗ 复制失败：{e}")
+                                return False
+                        else:
                             return True
-                        except Exception as e:
-                            print(f"  ✗ 复制失败：{e}")
-                            return False
                     else:
-                        return True
+                        print(f"  ✓ 预估值得转码，继续处理")
+                else:
+                    # 短视频或无法预估，直接转码
+                    print(f"  ℹ 短视频或无法预估，直接进行转码")
         else:
             print(f"  码率控制：固定码率模式")
             print(f"  目标视频码率：{self.target_bitrate}")
@@ -846,18 +1095,13 @@ class VideoReEncoder:
                     print(f"  ✓ 已拷贝原文件：{output_path.name}")
                     print(f"  ✓ 编码完成：{output_path.name}（未压缩）")
                     return True
+                else:
+                    # 压缩成功，显示体积减少
+                    size_reduction = (1 - compressed_size / original_size) * 100
+                    print(f"  体积减少：{size_reduction:.1f}%")
             
             # 正常情况：重命名临时文件为最终输出文件
             temp_output.rename(output_path)
-            
-            # 显示文件大小信息（CRF模式）
-            if self.crf is not None:
-                original_size_mb = input_path.stat().st_size / (1024 * 1024)
-                compressed_size_mb = output_path.stat().st_size / (1024 * 1024)
-                size_reduction = (1 - output_path.stat().st_size / input_path.stat().st_size) * 100
-                print(f"  原始文件大小：{original_size_mb:.2f} MB")
-                print(f"  压缩文件大小：{compressed_size_mb:.2f} MB")
-                print(f"  体积减少：{size_reduction:.1f}%")
             
             print(f"  ✓ 编码完成：{output_path.name}")
             return True
@@ -937,6 +1181,8 @@ def main():
   python main.py -i ./videos --crf 23  # 使用 CRF 模式，CRF值为23
   python main.py -i ./videos --crf 28 --codec hevc  # HEVC + CRF 28
   python main.py -i ./videos --crf 30 --codec av1   # AV1 + CRF 30
+  python main.py -i ./videos --crf 23 --min-benefit 15  # 最小收益15%才转码
+  python main.py -i ./videos --crf 23 --max-samples 3   # 最多3个采样点
         """
     )
     
@@ -956,6 +1202,10 @@ def main():
                        help='将因码率低于目标而跳过的视频复制到输出目录（默认不复制）')
     parser.add_argument('--crf', type=int, default=None,
                        help='CRF值（恒定质量因子），范围0-51，值越小质量越高。推荐使用：H.264(18-28), HEVC(20-30), AV1(25-35)。如果设置则优先使用CRF模式而非固定码率')
+    parser.add_argument('--min-benefit', type=float, default=10.0,
+                       help='CRF采样预估的最小收益阈值（百分比，默认10%）。预估收益低于此值将跳过转码')
+    parser.add_argument('--max-samples', type=int, default=5,
+                       help='CRF采样预估的最大采样点数（默认5个）')
     
     args = parser.parse_args()
     
@@ -968,7 +1218,9 @@ def main():
             use_gpu=not args.cpu,
             codec=args.codec,
             copy_skipped=args.copy_skipped,
-            crf=args.crf
+            crf=args.crf,
+            min_benefit_threshold=args.min_benefit,
+            max_sample_count=args.max_samples
         )
         encoder.process()
     except Exception as e:
