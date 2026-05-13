@@ -374,7 +374,7 @@ class VideoReEncoder:
                  target_bitrate: str = '1000K', recursive: bool = False, 
                  use_gpu: bool = True, codec: str = 'h264',
                  copy_skipped: bool = False, crf: Optional[int] = None,
-                 min_benefit_threshold: float = 10.0, max_sample_count: int = 5):
+                 min_benefit_threshold: float = -10.0, max_sample_count: int = 5):
         """
         初始化编码器
         
@@ -387,7 +387,7 @@ class VideoReEncoder:
             codec: 视频编码器类型 ('h264', 'hevc', 或 'av1')，默认 'h264'
             copy_skipped: 是否将跳过的视频复制到输出目录（默认 False）
             crf: CRF值（恒定质量因子），范围0-51，值越小质量越高。如果设置则优先使用CRF模式
-            min_benefit_threshold: CRF采样预估的最小收益阈值（百分比）
+            min_benefit_threshold: CRF采样预估的最小收益阈值（百分比，默认-10%，允许小幅增大以尝试压缩）
             max_sample_count: CRF采样预估的最大采样点数
         """
         self.input_dir = Path(input_dir)
@@ -1202,8 +1202,8 @@ def main():
                        help='将因码率低于目标而跳过的视频复制到输出目录（默认不复制）')
     parser.add_argument('--crf', type=int, default=None,
                        help='CRF值（恒定质量因子），范围0-51，值越小质量越高。推荐使用：H.264(18-28), HEVC(20-30), AV1(25-35)。如果设置则优先使用CRF模式而非固定码率')
-    parser.add_argument('--min-benefit', type=float, default=10.0,
-                       help='CRF采样预估的最小收益阈值（百分比，默认10%）。预估收益低于此值将跳过转码')
+    parser.add_argument('--min-benefit', type=float, default=-10.0,
+                       help='CRF采样预估的最小收益阈值（百分比，默认-10%）。负值表示允许文件略微增大以尝试压缩，实际压缩后会检测文件大小，只有更小时才采用')
     parser.add_argument('--max-samples', type=int, default=5,
                        help='CRF采样预估的最大采样点数（默认5个）')
     
