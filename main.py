@@ -333,6 +333,7 @@ class CRFSampleEstimator:
         overall_benefit = (1 - overall_ratio) * 100
         
         # 检查采样结果的离散程度
+        high_variance = False
         if len(samples) > 1:
             ratios = [s.compression_ratio for s in samples if s.success]
             if ratios:
@@ -342,14 +343,20 @@ class CRFSampleEstimator:
                 
                 # 如果标准差过大，说明视频内容变化大，预估可能不准确
                 if std_dev > 0.15:  # 标准差超过15%
-                    print(f"  ⚠ 采样结果差异较大 (σ={std_dev:.2f})，预估仅供参考")
+                    high_variance = True
+                    print(f"  ⚠ 采样结果差异较大 (σ={std_dev:.2f})，预估仅供参考，将进行实际压缩测试")
         
-        should_skip = overall_benefit < self.min_benefit_threshold * 100
+        # 当标准差过大时，不进行跳过判断，直接进行压缩尝试
+        if high_variance:
+            should_skip = False
+        else:
+            should_skip = overall_benefit < self.min_benefit_threshold * 100
         
         result = {
             'estimated_ratio': overall_ratio,
             'estimated_benefit': overall_benefit,
             'should_skip': should_skip,
+            'high_variance': high_variance,  # 添加高方差标记
             'sample_count': successful_samples,
             'samples': samples,
             'total_original_size': total_original,
@@ -358,6 +365,8 @@ class CRFSampleEstimator:
         
         if should_skip:
             print(f"  ⏭ 预估收益过低 ({overall_benefit:.1f}%)，将跳过转码")
+        elif high_variance:
+            print(f"  ℹ 采样差异较大，将进行实际压缩并比较文件大小")
         else:
             print(f"  ✓ 预估收益: {overall_benefit:.1f}% (压缩率: {overall_ratio:.2f})")
         
