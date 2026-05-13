@@ -38,18 +38,19 @@ class VideoReEncoder:
     def __init__(self, input_dir: str, output_dir: Optional[str] = None, 
                  target_bitrate: str = '1000K', recursive: bool = False, 
                  use_gpu: bool = True, codec: str = 'h264',
-                 copy_skipped: bool = False):
+                 copy_skipped: bool = False, crf: Optional[int] = None):
         """
         初始化编码器
         
         Args:
             input_dir: 输入目录路径
             output_dir: 输出目录路径，如果为 None 则生成在源文件同目录下
-            target_bitrate: 目标视频码率，如 '1000K', '2M' 等
+            target_bitrate: 目标视频码率，如 '1000K', '2M' 等（CRF模式下可选）
             recursive: 是否递归处理子目录
             use_gpu: 是否使用 GPU 硬件加速（默认 True）
             codec: 视频编码器类型 ('h264', 'hevc', 或 'av1')，默认 'h264'
             copy_skipped: 是否将跳过的视频复制到输出目录（默认 False）
+            crf: CRF值（恒定质量因子），范围0-51，值越小质量越高。如果设置则优先使用CRF模式
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else None
@@ -58,6 +59,15 @@ class VideoReEncoder:
         self.use_gpu = use_gpu
         self.codec = codec.lower()
         self.copy_skipped = copy_skipped
+        self.crf = crf
+        
+        # 如果使用CRF模式，验证CRF值范围
+        if self.crf is not None:
+            if not (0 <= self.crf <= 51):
+                raise ValueError(f"CRF值必须在0-51范围内，当前值：{self.crf}")
+            print(f"✓ 使用CRF模式，CRF值：{self.crf}")
+        else:
+            print(f"✓ 使用固定码率模式，目标码率：{self.target_bitrate}")
         
         if not self.input_dir.exists():
             raise FileNotFoundError(f"输入目录不存在：{input_dir}")
@@ -343,37 +353,52 @@ class VideoReEncoder:
         
         base_params = {
             'c:v': codec,
-            'b:v': self.target_bitrate,
             'c:a': 'aac',
             'strict': 'experimental',
             'y': None
         }
         
+        # 如果使用CRF模式，设置CRF参数
+        if self.crf is not None:
+            base_params['crf'] = str(self.crf)
+        else:
+            # 否则使用固定码率
+            base_params['b:v'] = self.target_bitrate
+        
         # 根据编码器类型调整参数
         if self.use_gpu and codec:
             if 'nvenc' in codec:
                 # NVIDIA NVENC 特定参数
-                base_params['preset'] = 'p7'  # 高质量预设
+                base_params['preset'] = 'p7'  # 高质量预设（NVENC最高质量）
                 base_params['tune'] = 'hq'    # 高质量调优
-                base_params['rc'] = 'vbr'     # 可变码率
                 
-                # AV1 特定优化
-                if 'av1' in codec:
-                    base_params['cq'] = '25'  # AV1 质量参数
-                    base_params['temporal-aq'] = '1'
-                    base_params['zerorefdelay'] = '1'
-                # HEVC 特定优化
-                elif 'hevc' in codec:
-                    base_params['cq'] = '23'
-                    base_params['temporal-aq'] = '1'
-                # H.264 特定优化
+                # 如果使用CRF模式，设置CQ值（NVENC使用-cq而非-crf）
+                if self.crf is not None:
+                    base_params['rc'] = 'vbr'     # 可变码率
+                    base_params['cq'] = str(self.crf)  # 使用用户设置的CRF值作为CQ
                 else:
-                    base_params['cq'] = '21'
+                    base_params['rc'] = 'vbr'     # 可变码率
+                    # AV1 特定优化
+                    if 'av1' in codec:
+                        base_params['cq'] = '25'  # AV1 质量参数
+                        base_params['temporal-aq'] = '1'
+                        base_params['zerorefdelay'] = '1'
+                    # HEVC 特定优化
+                    elif 'hevc' in codec:
+                        base_params['cq'] = '23'
+                        base_params['temporal-aq'] = '1'
+                    # H.264 特定优化
+                    else:
+                        base_params['cq'] = '21'
                     
             elif 'qsv' in codec:
                 # Intel QSV 特定参数
-                base_params['preset'] = 'slow'
+                base_params['preset'] = 'veryslow'  # CRF模式使用最慢预设以获得最佳压缩率
                 base_params['lookahead'] = '1'
+                
+                # 如果使用CRF模式，设置Global Quality
+                if self.crf is not None:
+                    base_params['global_quality'] = str(self.crf)
                 
                 # AV1 特定优化
                 if 'av1' in codec:
@@ -388,6 +413,12 @@ class VideoReEncoder:
                 base_params['quality'] = 'quality'
                 base_params['preusage'] = 'quality'
                 
+                # 如果使用CRF模式，设置QP值
+                if self.crf is not None:
+                    base_params['qp_i'] = str(self.crf)
+                    base_params['qp_p'] = str(self.crf)
+                    base_params['qp_b'] = str(self.crf)
+                
                 # AV1 特定优化
                 if 'av1' in codec:
                     base_params['en_preenc'] = '1'
@@ -399,28 +430,48 @@ class VideoReEncoder:
             # CPU 编码器参数
             if codec == 'libaom-av1':
                 # AOM-AV1 参数（慢但质量好）
-                base_params['cpu-used'] = '4'  # 速度/质量平衡
+                if self.crf is not None:
+                    # CRF模式：使用最慢预设以获得最佳压缩率
+                    base_params['cpu-used'] = '0'  # 最慢但质量最好（0-8，0最慢）
+                    base_params['crf'] = str(self.crf)
+                else:
+                    base_params['cpu-used'] = '4'  # 速度/质量平衡
                 base_params['auto-alt-ref'] = '1'
                 base_params['enable-cdef'] = '1'
                 base_params['enable-restoration'] = '1'
                 
             elif codec == 'svt-av1':
-                # SVT-AV1 参数（更快）
-                base_params['preset'] = '8'  # 1-13，数字越大越快
-                base_params['crf'] = '30'    # CRF 模式
+                # SVT-AV1 参数
+                if self.crf is not None:
+                    # CRF模式：使用最慢预设以获得最佳压缩率
+                    base_params['preset'] = '0'  # 0-13，0最慢质量最好
+                    base_params['crf'] = str(self.crf)
+                else:
+                    base_params['preset'] = '8'  # 默认速度
+                    base_params['crf'] = '30'
                 base_params['tile-columns'] = '4'
                 base_params['tile-rows'] = '2'
                 
             elif codec == 'libx265':
                 # x265 特定参数
-                base_params['preset'] = 'medium'
-                base_params['crf'] = '28'
+                if self.crf is not None:
+                    # CRF模式：使用veryslow预设以获得最佳压缩率
+                    base_params['preset'] = 'veryslow'
+                    base_params['crf'] = str(self.crf)
+                else:
+                    base_params['preset'] = 'medium'
+                    base_params['crf'] = '28'
                 base_params['x265-params'] = 'aq-mode=2:aq-strength=1.0'
                 
             elif codec == 'libx264':
                 # x264 特定参数
-                base_params['preset'] = 'medium'
-                base_params['crf'] = '23'
+                if self.crf is not None:
+                    # CRF模式：使用veryslow预设以获得最佳压缩率
+                    base_params['preset'] = 'veryslow'
+                    base_params['crf'] = str(self.crf)
+                else:
+                    base_params['preset'] = 'medium'
+                    base_params['crf'] = '23'
         
         return base_params
     
@@ -458,6 +509,106 @@ class VideoReEncoder:
             # 假设是纯数字，单位为 bps
             return int(bitrate_str)
     
+    def estimate_video_crf(self, video_path: Path) -> Optional[float]:
+        """
+        估算视频的等效CRF值
+            
+        通过分析视频的实际码率、分辨率、帧率和编码器类型，估算其大致的CRF质量水平。
+        CRF值越小表示质量越高。
+            
+        Args:
+            video_path: 视频文件路径
+                
+        Returns:
+            估算的CRF值，如果无法估算则返回None
+        """
+        try:
+            probe = ffmpeg.probe(str(video_path))
+                
+            # 获取视频流信息
+            video_stream = None
+            for stream in probe.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    video_stream = stream
+                    break
+                
+            if not video_stream:
+                return None
+                
+            # 获取关键参数
+            codec_name = video_stream.get('codec_name', '').lower()
+            width = int(video_stream.get('width', 0))
+            height = int(video_stream.get('height', 0))
+            bit_rate = video_stream.get('bit_rate')
+            
+            # 获取帧率（用于更准确的估算）
+            frame_rate_str = video_stream.get('r_frame_rate', '30/1')
+            if '/' in frame_rate_str:
+                num, den = frame_rate_str.split('/')
+                frame_rate = float(num) / float(den) if float(den) != 0 else 30
+            else:
+                frame_rate = float(frame_rate_str)
+                
+            if not bit_rate or bit_rate == 'N/A':
+                # 尝试从 format获取
+                format_bitrate = probe.get('format', {}).get('bit_rate')
+                if format_bitrate and format_bitrate != 'N/A':
+                    bit_rate = format_bitrate
+                else:
+                    # 无法获取码率，返回None让程序继续编码
+                    return None
+                
+            bit_rate = int(bit_rate)
+            resolution = width * height
+            
+            # 检查码率是否合理（排除异常情况）
+            # 如果码率过高（>100Mbps），可能是VBR峰值或异常值，不进行估算
+            if bit_rate > 100_000_000:
+                print(f"  ⚠ 警告：检测到异常高的码率 ({bit_rate/1_000_000:.1f}Mbps)，跳过质量检测")
+                return None
+            
+            # 计算每像素每帧的比特数（bpp），这是更准确的质量指标
+            # bpp = bit_rate / (width * height * frame_rate)
+            if frame_rate > 0 and resolution > 0:
+                bpp = bit_rate / (resolution * frame_rate)
+            else:
+                bpp = 0.1  # 默认值
+            
+            # 根据不同编码器，使用bpp来估算CRF
+            # bpp与CRF的关系：bpp越高，CRF越低（质量越好）
+            if 'h264' in codec_name or 'avc' in codec_name:
+                # H.264: bpp 0.1 ≈ CRF 23, bpp 0.2 ≈ CRF 18, bpp 0.05 ≈ CRF 28
+                # 公式：CRF = 23 - 15 * log2(bpp / 0.1)
+                import math
+                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.1)
+            elif 'hevc' in codec_name or 'h265' in codec_name:
+                # HEVC效率比H.264高约50%，相同bpp下CRF可以更低
+                # HEVC: bpp 0.05 ≈ CRF 23, bpp 0.1 ≈ CRF 18
+                import math
+                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.05)
+            elif 'av1' in codec_name:
+                # AV1效率更高
+                # AV1: bpp 0.04 ≈ CRF 23, bpp 0.08 ≈ CRF 18
+                import math
+                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.04)
+            else:
+                # 未知编码器，使用H.264作为参考
+                import math
+                estimated_crf = 23 - 15 * math.log2(max(0.01, bpp) / 0.1)
+            
+            # 限制在合理范围内（1-51）
+            # CRF=0是无损，实际很少使用；CRF=51是最低质量
+            estimated_crf = max(1, min(51, estimated_crf))
+            
+            # 调试信息：显示计算过程
+            # print(f"  [调试] 分辨率: {width}x{height}, 帧率: {frame_rate:.1f}fps, bpp: {bpp:.4f}")
+                
+            return round(estimated_crf, 1)
+                
+        except Exception as e:
+            print(f"  ⚠ 无法估算视频CRF值：{e}")
+            return None
+    
     def encode_video(self, input_path: Path, output_path: Path) -> bool:
         """
         编码单个视频文件
@@ -482,13 +633,50 @@ class VideoReEncoder:
         else:
             format_display = 'H.264'
         print(f"  编码格式：{format_display}")
-        print(f"  目标视频码率：{self.target_bitrate}")
         
-        # 获取原始视频码率
+        # 显示码率控制模式
+        if self.crf is not None:
+            print(f"  码率控制：CRF模式 (CRF={self.crf})")
+            
+            # CRF模式下，检测视频质量是否需要压缩
+            estimated_crf = self.estimate_video_crf(input_path)
+            if estimated_crf is not None:
+                print(f"  估算视频质量：等效CRF≈{estimated_crf}")
+                
+                # CRF值越小质量越高，如果视频的等效CRF < 目标CRF，说明质量过高，可以压缩以减小体积
+                if estimated_crf < self.crf:
+                    crf_diff = self.crf - estimated_crf
+                    print(f"  ℹ 需要重新编码：视频质量超过目标（{estimated_crf} < {self.crf}），将压缩以减小体积（差距{crf_diff:.1f}）")
+                else:
+                    # estimated_crf >= self.crf，视频质量已达标或不足，直接跳过
+                    if estimated_crf == self.crf:
+                        print(f"  ✓ 跳过：视频质量正好达到目标标准（{estimated_crf} = {self.crf}）")
+                    else:
+                        print(f"  ✓ 跳过：视频质量未达标但保持原样（{estimated_crf} > {self.crf}）")
+                    
+                    # 如果启用了复制跳过文件功能
+                    if self.copy_skipped:
+                        print(f"  📋 复制原文件到输出目录...")
+                        try:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(str(input_path), str(output_path))
+                            print(f"  ✓ 复制完成：{output_path.name}")
+                            return True
+                        except Exception as e:
+                            print(f"  ✗ 复制失败：{e}")
+                            return False
+                    else:
+                        return True
+        else:
+            print(f"  码率控制：固定码率模式")
+            print(f"  目标视频码率：{self.target_bitrate}")
+        
+        # 获取原始视频码率（用于信息显示）
         original_bitrate = self.get_video_bitrate(input_path)
-        target_bitrate_bps = self.parse_bitrate_to_bps(self.target_bitrate)
         
-        if original_bitrate:
+        # 在固定码率模式下检查原始码率
+        if self.crf is None and original_bitrate:
+            target_bitrate_bps = self.parse_bitrate_to_bps(self.target_bitrate)
             print(f"  原始视频码率：{original_bitrate:,} bps ({original_bitrate/1000:.0f}K)")
             print(f"  目标视频码率：{target_bitrate_bps:,} bps ({target_bitrate_bps/1000:.0f}K)")
             
@@ -531,7 +719,30 @@ class VideoReEncoder:
                 str(self.FFMPEG_DIR / 'ffmpeg.exe'),
                 '-i', str(input_path),
                 '-c:v', self.get_video_codec(),
-                '-b:v', self.target_bitrate,
+            ]
+            
+            # 根据模式和编码器类型添加码率控制参数
+            codec_name = self.get_video_codec()
+            
+            if self.crf is not None:
+                # CRF模式：不同编码器使用不同的参数名
+                if 'nvenc' in codec_name:
+                    # NVIDIA GPU编码器使用 -cq
+                    cmd.extend(['-cq', str(self.crf)])
+                elif 'qsv' in codec_name:
+                    # Intel QSV使用 -global_quality
+                    cmd.extend(['-global_quality', str(self.crf)])
+                elif 'amf' in codec_name:
+                    # AMD AMF使用 -qp_i -qp_p -qp_b
+                    cmd.extend(['-qp_i', str(self.crf), '-qp_p', str(self.crf), '-qp_b', str(self.crf)])
+                else:
+                    # CPU编码器使用 -crf
+                    cmd.extend(['-crf', str(self.crf)])
+            else:
+                # 固定码率模式
+                cmd.extend(['-b:v', self.target_bitrate])
+            
+            cmd.extend([
                 '-c:a', 'aac',
                 '-b:a', audio_bitrate,
                 '-strict', 'experimental',
@@ -541,7 +752,7 @@ class VideoReEncoder:
                 '-stats_period', '0.5',
                 '-y',
                 str(temp_output)
-            ]
+            ])
             
             # 启动进程
             process = subprocess.Popen(
@@ -602,7 +813,46 @@ class VideoReEncoder:
                         error_output = error_bytes.decode('latin-1', errors='ignore')
                     raise RuntimeError(f"FFmpeg 错误：{error_output[:500]}")
             
+            # CRF模式下，检查压缩后的文件大小
+            if self.crf is not None and temp_output.exists():
+                original_size = input_path.stat().st_size
+                compressed_size = temp_output.stat().st_size
+                
+                original_size_mb = original_size / (1024 * 1024)
+                compressed_size_mb = compressed_size / (1024 * 1024)
+                size_ratio = (compressed_size - original_size) / original_size * 100
+                
+                print(f"  原始文件大小：{original_size_mb:.2f} MB")
+                print(f"  压缩文件大小：{compressed_size_mb:.2f} MB")
+                
+                # 如果压缩后文件更大，使用原文件
+                if compressed_size > original_size:
+                    print(f"  ⚠ 警告：压缩后文件体积增大了 {size_ratio:.1f}%")
+                    print(f"  📋 使用原文件（删除压缩文件）...")
+                    
+                    # 删除临时压缩文件
+                    temp_output.unlink()
+                    
+                    # 复制原文件到输出位置
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(input_path), str(output_path))
+                    
+                    print(f"  ✓ 已拷贝原文件：{output_path.name}")
+                    print(f"  ✓ 编码完成：{output_path.name}（未压缩）")
+                    return True
+            
+            # 正常情况：重命名临时文件为最终输出文件
             temp_output.rename(output_path)
+            
+            # 显示文件大小信息（CRF模式）
+            if self.crf is not None:
+                original_size_mb = input_path.stat().st_size / (1024 * 1024)
+                compressed_size_mb = output_path.stat().st_size / (1024 * 1024)
+                size_reduction = (1 - output_path.stat().st_size / input_path.stat().st_size) * 100
+                print(f"  原始文件大小：{original_size_mb:.2f} MB")
+                print(f"  压缩文件大小：{compressed_size_mb:.2f} MB")
+                print(f"  体积减少：{size_reduction:.1f}%")
+            
             print(f"  ✓ 编码完成：{output_path.name}")
             return True
             
@@ -661,6 +911,9 @@ def main():
   python main.py -i ./videos -b 800K --codec hevc  # 使用 HEVC 编码
   python main.py -i ./videos -b 600K --codec av1   # 使用 AV1 编码（推荐）
   python main.py -i ./videos -b 1000K -o ./output --copy-skipped  # 复制跳过的视频
+  python main.py -i ./videos --crf 23  # 使用 CRF 模式，CRF值为23
+  python main.py -i ./videos --crf 28 --codec hevc  # HEVC + CRF 28
+  python main.py -i ./videos --crf 30 --codec av1   # AV1 + CRF 30
         """
     )
     
@@ -669,7 +922,7 @@ def main():
     parser.add_argument('-o', '--output-dir', default=None,
                        help='输出目录路径（默认保存在源文件同目录，添加_compressed 后缀）')
     parser.add_argument('-b', '--bitrate', default='1000K',
-                       help='目标视频码率（默认：1000K），例如：500K, 1M, 2M 等')
+                       help='目标视频码率（默认：1000K），例如：500K, 1M, 2M 等。如果指定了--crf则此参数可选')
     parser.add_argument('-r', '--recursive', action='store_true',
                        help='是否递归处理子目录')
     parser.add_argument('--cpu', action='store_true',
@@ -678,6 +931,8 @@ def main():
                        help='视频编码格式（默认：h264）。选项：h264（兼容性好）、hevc（高效）、av1（最新最高效）')
     parser.add_argument('--copy-skipped', '-c', action='store_true',
                        help='将因码率低于目标而跳过的视频复制到输出目录（默认不复制）')
+    parser.add_argument('--crf', type=int, default=None,
+                       help='CRF值（恒定质量因子），范围0-51，值越小质量越高。推荐使用：H.264(18-28), HEVC(20-30), AV1(25-35)。如果设置则优先使用CRF模式而非固定码率')
     
     args = parser.parse_args()
     
@@ -689,7 +944,8 @@ def main():
             recursive=args.recursive,
             use_gpu=not args.cpu,
             codec=args.codec,
-            copy_skipped=args.copy_skipped
+            copy_skipped=args.copy_skipped,
+            crf=args.crf
         )
         encoder.process()
     except Exception as e:
