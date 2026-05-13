@@ -620,6 +620,12 @@ class VideoReEncoder:
         Returns:
             bool: 编码是否成功
         """
+        # 检查输出文件是否已存在，如果存在则跳过
+        if output_path.exists():
+            print(f"\n正在处理：{input_path.name}")
+            print(f"  ✓ 跳过：输出文件已存在 {output_path.name}")
+            return True
+        
         print(f"\n正在处理：{input_path.name}")
         codec_name = self.get_video_codec()
         codec_display = f"{'GPU - ' if self.use_gpu and any(g in codec_name for g in ['nvenc', 'qsv', 'amf']) else 'CPU - '}{codec_name}"
@@ -856,6 +862,16 @@ class VideoReEncoder:
             print(f"  ✓ 编码完成：{output_path.name}")
             return True
             
+        except KeyboardInterrupt:
+            print(f"\n  ⚠ 用户取消操作")
+            # 删除临时文件和输出文件
+            if temp_output.exists():
+                temp_output.unlink()
+                print(f"  🗑 已删除临时文件：{temp_output.name}")
+            if output_path.exists():
+                output_path.unlink()
+                print(f"  🗑 已删除输出文件：{output_path.name}")
+            raise  # 重新抛出异常，让上层处理
         except Exception as e:
             error_msg = str(e)
             print(f"  ✗ 编码失败：{error_msg}")
@@ -877,20 +893,27 @@ class VideoReEncoder:
         success_count = 0
         fail_count = 0
         
-        for i, video_path in enumerate(video_files, 1):
-            print(f"\n[{i}/{len(video_files)}]")
-            
-            if self.output_dir:
-                relative_path = video_path.relative_to(self.input_dir)
-                output_path = self.output_dir / relative_path
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-            else:
-                output_path = video_path.parent / f"{video_path.stem}_compressed{video_path.suffix}"
-            
-            if self.encode_video(video_path, output_path):
-                success_count += 1
-            else:
-                fail_count += 1
+        try:
+            for i, video_path in enumerate(video_files, 1):
+                print(f"\n[{i}/{len(video_files)}]")
+                
+                if self.output_dir:
+                    relative_path = video_path.relative_to(self.input_dir)
+                    output_path = self.output_dir / relative_path
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    output_path = video_path.parent / f"{video_path.stem}_compressed{video_path.suffix}"
+                
+                if self.encode_video(video_path, output_path):
+                    success_count += 1
+                else:
+                    fail_count += 1
+        except KeyboardInterrupt:
+            print("\n" + "=" * 60)
+            print(f"⚠ 用户中断操作")
+            print(f"已处理：{success_count} 个成功，{fail_count} 个失败")
+            print("程序已退出")
+            return
         
         print("\n" + "=" * 60)
         print(f"处理完成！")
