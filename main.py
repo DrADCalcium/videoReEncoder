@@ -346,11 +346,16 @@ class CRFSampleEstimator:
                     high_variance = True
                     print(f"  ⚠ 采样结果差异较大 (σ={std_dev:.2f})，预估仅供参考，将进行实际压缩测试")
         
-        # 当标准差过大时，使用更宽松的跳过条件
+        # 当标准差过大时，根据配置决定是否使用更宽松的跳过条件
         if high_variance:
-            # 高方差情况下，只有当预估收益比最小要求再低15%时才跳过
-            skip_threshold = self.min_benefit_threshold * 100 - 15
-            should_skip = overall_benefit < skip_threshold
+            # 只有当最小压缩要求的收益高于默认值（-10%）时，才使用宽松条件
+            if self.min_benefit_threshold > -0.10:  # -0.10 = -10%
+                # 高方差且用户设置了更保守的阈值，使用宽松条件：比最小要求再低15%
+                skip_threshold = self.min_benefit_threshold * 100 - 15
+                should_skip = overall_benefit < skip_threshold
+            else:
+                # 使用默认或更激进的配置，高方差时不进行额外跳过判断
+                should_skip = overall_benefit < self.min_benefit_threshold * 100
         else:
             # 正常情况，使用标准的跳过条件
             should_skip = overall_benefit < self.min_benefit_threshold * 100
@@ -367,14 +372,17 @@ class CRFSampleEstimator:
         }
         
         if should_skip:
-            if high_variance:
+            if high_variance and self.min_benefit_threshold > -0.10:
                 skip_threshold = self.min_benefit_threshold * 100 - 15
                 print(f"  ⏭ 预估收益过低 ({overall_benefit:.1f}% < {skip_threshold:.1f}%)，将跳过转码")
             else:
                 print(f"  ⏭ 预估收益过低 ({overall_benefit:.1f}%)，将跳过转码")
         elif high_variance:
-            skip_threshold = self.min_benefit_threshold * 100 - 15
-            print(f"  ℹ 采样差异较大，但预估收益 ({overall_benefit:.1f}%) 高于跳过阈值 ({skip_threshold:.1f}%)，将进行实际压缩并比较文件大小")
+            if self.min_benefit_threshold > -0.10:
+                skip_threshold = self.min_benefit_threshold * 100 - 15
+                print(f"  ℹ 采样差异较大，但预估收益 ({overall_benefit:.1f}%) 高于跳过阈值 ({skip_threshold:.1f}%)，将进行实际压缩并比较文件大小")
+            else:
+                print(f"  ℹ 采样差异较大，将进行实际压缩并比较文件大小")
         else:
             print(f"  ✓ 预估收益: {overall_benefit:.1f}% (压缩率: {overall_ratio:.2f})")
         
