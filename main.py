@@ -360,6 +360,45 @@ class CRFSampleEstimator:
             # 正常情况，使用标准的跳过条件
             should_skip = overall_benefit < self.min_benefit_threshold * 100
         
+        # 新增：检查是否有采样点显示出明显的压缩潜力
+        # 条件1：至少有一个采样点的收益比min_benefit_threshold高30个百分点
+        # 条件2：至少有两个采样点的收益比min_benefit_threshold高10个百分点
+        # 满足任一条件即不跳过
+        has_promising_sample = False
+        if samples:
+            successful_samples_list = [s for s in samples if s.success]
+            if successful_samples_list:
+                # 计算两个阈值（百分点加法）
+                # min_benefit_threshold是小数形式（如-0.10表示-10%）
+                threshold_30_points = self.min_benefit_threshold + 0.30  # 高30个百分点
+                threshold_10_points = self.min_benefit_threshold + 0.10  # 高10个百分点
+                
+                # 统计满足两个条件的采样点数量
+                count_above_30 = 0  # 高于30个百分点阈值的数量
+                count_above_10 = 0  # 高于10个百分点阈值的数量
+                
+                for sample in successful_samples_list:
+                    sample_benefit_ratio = 1 - sample.compression_ratio  # 小数形式
+                    if sample_benefit_ratio >= threshold_30_points:
+                        count_above_30 += 1
+                    if sample_benefit_ratio >= threshold_10_points:
+                        count_above_10 += 1
+                
+                # 检查是否满足任一条件
+                if count_above_30 >= 1:
+                    has_promising_sample = True
+                    threshold_percent = threshold_30_points * 100
+                    print(f"  ℹ 发现{count_above_30}个高采益采样点（>= {threshold_percent:.1f}%），将进行实际压缩测试")
+                elif count_above_10 >= 2:
+                    has_promising_sample = True
+                    threshold_percent = threshold_10_points * 100
+                    print(f"  ℹ 发现{count_above_10}个中收益采样点（>= {threshold_percent:.1f}%），将进行实际压缩测试")
+                
+                # 如果有高收益采样点，即使整体收益不高，也不跳过
+                if has_promising_sample and should_skip:
+                    should_skip = False
+                    print(f"  ℹ 虽然整体预估收益较低，但存在高收益采样点，将尝试压缩并比对文件大小")
+        
         result = {
             'estimated_ratio': overall_ratio,
             'estimated_benefit': overall_benefit,
