@@ -1267,7 +1267,7 @@ def main():
     parser.add_argument('--crf', type=int, default=None,
                        help='CRF值（恒定质量因子），范围0-51，值越小质量越高。推荐使用：H.264(18-28), HEVC(20-30), AV1(25-35)。如果设置则优先使用CRF模式而非固定码率')
     parser.add_argument('--min-benefit', type=float, default=-10.0,
-                       help='CRF采样预估的最小收益阈值（百分比，默认-10%）。负值表示允许文件略微增大以尝试压缩，实际压缩后会检测文件大小，只有更小时才采用')
+                       help='CRF采样预估的最小收益阈值（百分比，默认-10%%）。负值表示允许文件略微增大以尝试压缩，实际压缩后会检测文件大小，只有更小时才采用')
     parser.add_argument('--max-samples', type=int, default=5,
                        help='CRF采样预估的最大采样点数（默认5个）')
     
